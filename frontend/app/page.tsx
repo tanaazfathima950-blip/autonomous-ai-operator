@@ -1,556 +1,544 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
 import {
-  AlertTriangle,
-  Bot,
-  Check,
-  CheckCircle2,
-  Circle,
-  Download,
-  FileSpreadsheet,
-  Loader2,
-  Mail,
-  Pencil,
-  Play,
-  Send,
-  Sparkles,
-  X,
+  AlertTriangle, Briefcase, CheckCircle2, ChevronDown, ChevronRight, Circle,
+  Copy, FileSpreadsheet, Loader2, Mail, RefreshCw, Send, ShieldCheck, X, Check,
 } from "lucide-react";
 
-/* ------------------------------------------------------------------ */
-/* Config — agree these with your backend teammate                      */
-/* ------------------------------------------------------------------ */
+/* ---------- Config ---------- */
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const START_PATH = "/approval/start"; // POST { task }
-const DECIDE_PATH = "/approval/decide"; // POST { thread_id, action, content?, emails?, feedback? }
-// Set NEXT_PUBLIC_MOCK=true to demo the UI without the backend running.
+const DEFAULT_GOAL = "Find 3 CS internships for a third-year student";
+
+/* ---------- Types ---------- */
+type Obj = Record<string, any>;
+interface AuditEntry { time: string; node: string; event: string; detail: string }
+interface Interrupt {
+  type?: string; message?: string; spreadsheet_path?: string | null;
+  spreadsheet_saved?: boolean; error_status?: string | null;
+  internships?: Obj[]; drafted_emails?: Obj[];
+}
+interface Resp {
+  thread_id: string; requires_input: boolean; interrupt?: Interrupt | null;
+  next?: string[]; internships?: Obj[]; drafted_emails?: Obj[];
+  spreadsheet_saved: boolean; spreadsheet_path?: string | null;
+  error_status?: string | null; retry_count: number;
+  approval_status?: "approved" | "rejected" | "retry" | null;
+  messages?: string[]; plan?: string[]; audit_log?: AuditEntry[];
+}
+
+/* ---------- Helpers ---------- */
+const pick = (o: Obj, keys: string[]) => {
+  for (const k of keys) {
+    const v = o?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+  }
+  return "";
+};
+/* ---------- Mock mode (demo without backend) ---------- */
 const MOCK = process.env.NEXT_PUBLIC_MOCK === "true";
-
-const PRESET_PROMPT =
-  "Find three internship opportunities suitable for a third-year computer science student, compare their eligibility criteria, save the best matches to a spreadsheet, and prepare personalized draft emails for each opportunity.";
-
-/* ------------------------------------------------------------------ */
-/* Types                                                                */
-/* ------------------------------------------------------------------ */
-type StepStatus = "pending" | "running" | "done" | "error";
-type Phase = "idle" | "running" | "awaiting" | "deciding" | "sent";
-
-interface Step {
-  id: string;
-  label: string;
-  status: StepStatus;
-}
-interface Email {
-  id: string;
-  to?: string;
-  subject: string;
-  body: string;
-}
-interface Spreadsheet {
-  filename: string;
-  rows?: number;
-  url?: string; // optional download link served by the backend
-  verified?: boolean;
-}
-interface OperatorResponse {
-  thread_id?: string;
-  requires_input: boolean;
-  status?: string;
-  steps?: Step[]; // optional: real step states from the backend
-  spreadsheet?: Spreadsheet;
-  emails?: Email[];
-  draft?: string; // fallback: the template's single-draft string
-  final_output?: string;
-  error?: string;
-}
-
-const STEP_DEFS = [
-  { id: "research", label: "Researching internships" },
-  { id: "spreadsheet", label: "Saving to spreadsheet" },
-  { id: "drafts", label: "Drafting emails" },
-  { id: "approval", label: "Awaiting approval" },
-  { id: "sent", label: "Sending" },
-];
-
-/* ------------------------------------------------------------------ */
-/* Mock backend (only used when NEXT_PUBLIC_MOCK=true)                  */
-/* ------------------------------------------------------------------ */
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function mockStart(): Promise<OperatorResponse> {
-  await sleep(7500);
+const M_INTERN = [
+  { title: "STEP Intern", company: "Google", link: "https://careers.google.com", eligibility: "2nd-3rd year CS" },
+  { title: "SWE Intern", company: "Microsoft", link: "https://careers.microsoft.com", eligibility: "3rd year CS, CGPA 7.5+" },
+  { title: "Research Intern", company: "Adobe", link: "https://adobe.com/careers", eligibility: "3rd year CS, ML basics" },
+];
+const M_EMAILS = M_INTERN.map((i) => ({
+  subject: `Application for ${i.title} - ${i.company}`,
+  body: `Dear ${i.company} Hiring Team,\n\nI am a third-year Computer Science student interested in the ${i.title} role. My profile matches your eligibility (${i.eligibility}).\n\nRegards,\nStudent`,
+}));
+let M = { fails: 0, retries: 0, saved: false, audit: [] as AuditEntry[], msgs: [] as string[] };
+const mlog = (node: string, event: string, detail: string) =>
+  M.audit.push({ time: new Date().toLocaleTimeString(), node, event, detail });
+function mockSave() {
+  while (true) {
+    if (M.fails > 0) {
+      M.fails--; M.retries++;
+      mlog("excel_writer", "save_failed", "Excel file locked (simulated outage)");
+      continue;
+    }
+    M.saved = true;
+    mlog("excel_writer", "spreadsheet_saved", "internships_matched.xlsx");
+    return;
+  }
+}
+function snap(done: boolean, approval: Resp["approval_status"]): Resp {
+  const path = M.saved ? "outputs/internships_matched.xlsx" : null;
   return {
     thread_id: "mock-thread",
-    requires_input: true,
-    status: "awaiting_review",
-    spreadsheet: { filename: "internships_matched.xlsx", rows: 3, verified: true },
-    emails: [1, 2, 3].map((n) => ({
-      id: `e${n}`,
-      to: `careers@company${n}.example`,
-      subject: `Application for Software Engineering Internship — Tanaaz Fathima`,
-      body: `Dear Hiring Team,\n\nI am a third-year Information Science student with a 9.0+ CGPA and experience in Python, Java and DSA. I would love to apply for the internship at Company ${n}.\n\nBest regards,\nTanaaz Fathima`,
-    })),
+    requires_input: !done,
+    interrupt: done ? null : {
+      type: "approval_request",
+      message: "Please review the internships and drafted emails before finalizing.",
+      spreadsheet_path: path, spreadsheet_saved: M.saved, error_status: null,
+      internships: M_INTERN, drafted_emails: M_EMAILS,
+    },
+    internships: M_INTERN, drafted_emails: M_EMAILS,
+    spreadsheet_saved: M.saved, spreadsheet_path: path, error_status: null,
+    retry_count: M.retries, approval_status: approval, messages: M.msgs,
+    plan: ["Search internships", "Draft emails", "Save to Excel", "Wait for human approval"],
+    audit_log: M.audit,
   };
 }
-async function mockDecide(action: string): Promise<OperatorResponse> {
-  await sleep(1200);
-  if (action === "reject") {
-    return {
-      requires_input: true,
-      status: "awaiting_review",
-      spreadsheet: { filename: "internships_matched.xlsx", rows: 3, verified: true },
-      emails: [1, 2, 3].map((n) => ({
-        id: `e${n}`,
-        to: `careers@company${n}.example`,
-        subject: `Internship Application — Tanaaz Fathima (Revised)`,
-        body: `Dear Hiring Team,\n\nI am a third-year ISE student with a 9.0+ CGPA. I built a portfolio website and would love to apply to Company ${n}.\n\nBest regards,\nTanaaz Fathima`,
-      })),
-    };
+async function mockPost(path: string, body: Obj): Promise<Resp> {
+  if (path.endsWith("/start")) {
+    await sleep(3500);
+    M = { fails: body.simulate_failures ?? 0, retries: 0, saved: false, audit: [], msgs: [] };
+    mlog("planner", "plan_created", body.goal);
+    M.msgs.push("Planning tasks");
+    mlog("search", "internships_found", "3 internships found");
+    M.msgs.push("Found 3 internships");
+    mlog("email_drafter", "emails_drafted", "3 drafts created");
+    M.msgs.push("Drafted 3 emails");
+    mockSave();
+    M.msgs.push("Spreadsheet saved");
+    mlog("human_approval", "awaiting_human", "Paused for approval");
+    M.msgs.push("Waiting for human approval");
+    return snap(false, null);
   }
-  return {
-    requires_input: false,
-    status: "sent",
-    final_output: "All 3 application emails were approved and sent.",
-  };
+  await sleep(1000);
+  const a = body.action as string;
+  mlog("human_approval", `human_${a}`, `Human chose ${a}`);
+  if (a === "approve") {
+    M.msgs.push("Approved. 3 email drafts finalized and spreadsheet saved.");
+    return snap(true, "approved");
+  }
+  M.msgs.push("Rejected. Run stopped without finalizing.");
+  return snap(true, "rejected");
 }
-/* ------------------------------------------------------------------ */
-/* Component                                                            */
-/* ------------------------------------------------------------------ */
-export default function OperatorPage() {
-  const [task, setTask] = useState("");
-  const [threadId, setThreadId] = useState<string | null>(null);
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [tick, setTick] = useState(0); // client-side progress while waiting
-  const [serverSteps, setServerSteps] = useState<Step[] | null>(null);
-  const [spreadsheet, setSpreadsheet] = useState<Spreadsheet | null>(null);
-  const [emails, setEmails] = useState<Email[]>([]);
-  const [finalOutput, setFinalOutput] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  const [editing, setEditing] = useState(false);
-  const [dirty, setDirty] = useState(false);
-  const [rejecting, setRejecting] = useState(false);
-  const [feedback, setFeedback] = useState("");
-  const [log, setLog] = useState<{ t: string; msg: string }[]>([]);
-  const logEnd = useRef<HTMLDivElement>(null);
-
-  const addLog = (msg: string) =>
-    setLog((l) => [...l, { t: new Date().toLocaleTimeString(), msg }]);
-
-  useEffect(() => {
-    logEnd.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [log]);
-
-  // While the start request is in flight, advance the first three steps on a
-  // timer. This is only an estimate; real `steps` from the backend override it.
-  useEffect(() => {
-    if (phase !== "running") return;
-    setTick(0);
-    const id = setInterval(() => setTick((t) => Math.min(t + 1, 2)), 2500);
-    return () => clearInterval(id);
-  }, [phase]);
-
-  useEffect(() => {
-    if (phase !== "running") return;
-    const msgs = [
-      "Researching internship opportunities…",
-      "Saving matches to spreadsheet…",
-      "Drafting personalized emails…",
-    ];
-    if (tick > 0) addLog(msgs[tick]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick]);
-
-  const applyResponse = (data: OperatorResponse) => {
-    if (data.thread_id) setThreadId(data.thread_id);
-    setServerSteps(data.steps ?? null);
-    if (data.spreadsheet) setSpreadsheet(data.spreadsheet);
-    if (data.emails?.length) {
-      setEmails(data.emails);
-    } else if (data.draft) {
-      setEmails([{ id: "draft", subject: "Draft", body: data.draft }]);
-    }
-    setFinalOutput(data.final_output ?? "");
-    setEditing(false);
-    setRejecting(false);
-    setFeedback("");
-    setDirty(false);
-
-    const sent = data.status === "sent" || data.status === "sent_with_unresolved_feedback";
-    if (sent) {
-      setPhase("sent");
-      addLog("Emails approved and sent ✔");
-    } else if (data.requires_input || data.status === "awaiting_review") {
-      setPhase("awaiting");
-      addLog("Paused — waiting for your approval");
-    }
-  };
-
-  const startRun = async (override?: string) => {
-    const goal = (override ?? task).trim();
-    if (!goal) return;
-    setTask(goal);
-    setError(null);
-    setLog([]);
-    setSpreadsheet(null);
-    setEmails([]);
-    setFinalOutput("");
-    setServerSteps(null);
-    setThreadId(null);
-    setPhase("running");
-    addLog("Goal received — planning tasks");
-    try {
-      let data: OperatorResponse;
-      if (MOCK) {
-        data = await mockStart();
-      } else {
-        const res = await fetch(`${API_URL}${START_PATH}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ task: goal }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        data = await res.json();
-      }
-      if (data.error) throw new Error(data.error);
-      applyResponse(data);
-    } catch (e) {
-      setPhase("idle");
-      addLog("Run failed");
-      setError(
-        `Could not run the operator (${(e as Error).message}). Is the backend running on ${API_URL}?`
-      );
-    }
-  };
-
-  const decide = async (action: "approve" | "edit" | "reject") => {
-    if (!threadId && !MOCK) return;
-    setError(null);
-    setPhase("deciding");
-    addLog(
-      action === "reject" ? "Sent feedback — redrafting…" : "Approved — sending emails…"
-    );
-    try {
-      let data: OperatorResponse;
-      if (MOCK) {
-        data = await mockDecide(action);
-      } else {
-        const res = await fetch(`${API_URL}${DECIDE_PATH}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            thread_id: threadId,
-            action,
-            emails: action === "edit" ? emails : undefined,
-            // the template's approval endpoint expects a single `content` string
-            content:
-              action === "edit"
-                ? emails.map((e) => `Subject: ${e.subject}\n\n${e.body}`).join("\n\n---\n\n")
-                : undefined,
-            feedback: action === "reject" ? feedback : undefined,
-          }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        data = await res.json();
-      }
-      applyResponse(data);
-    } catch (e) {
-      setPhase("awaiting");
-      setError(`Could not submit your decision (${(e as Error).message}). Please try again.`);
-    }
-  };
-
-  const reset = () => {
-    setTask("");
-    setThreadId(null);
-    setPhase("idle");
-    setSpreadsheet(null);
-    setEmails([]);
-    setFinalOutput("");
-    setServerSteps(null);
-    setLog([]);
-    setError(null);
-  };
-
-  const updateEmail = (id: string, patch: Partial<Email>) => {
-    setEmails((list) => list.map((e) => (e.id === id ? { ...e, ...patch } : e)));
-    setDirty(true);
-  };
-
-  /* ---- derive the timeline ---- */
-  const steps: Step[] =
-    serverSteps ??
-    STEP_DEFS.map((s, i) => {
-      let status: StepStatus = "pending";
-      if (phase === "running") status = i < tick ? "done" : i === tick ? "running" : "pending";
-      else if (phase === "awaiting") status = i < 3 ? "done" : i === 3 ? "running" : "pending";
-      else if (phase === "deciding") status = i < 4 ? "done" : "running";
-      else if (phase === "sent") status = "done";
-      return { ...s, status };
+async function post(path: string, body: Obj): Promise<Resp> {
+       if (MOCK) return mockPost(path, body);
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
+  } catch {
+    throw new Error(`Cannot reach the backend at ${API_URL}. Is it running?`);
+  }
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+    } catch {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
 
-  const busy = phase === "running" || phase === "deciding";
-  const reviewing = phase === "awaiting" || phase === "deciding";
+const eventStyle = (ev: string) => {
+  const e = ev.toLowerCase();
+  if (e.includes("fail") || e.includes("error")) return "bg-red-50 text-red-700 border-red-200";
+  if (e.includes("fallback") || e.includes("unavailable")) return "bg-amber-50 text-amber-700 border-amber-200";
+  if (/(human|approv|reject|retry|decision)/.test(e)) return "bg-blue-50 text-blue-700 border-blue-200";
+  if (/(saved|success|complete|found|drafted|final|done)/.test(e)) return "bg-emerald-50 text-emerald-700 border-emerald-200";
+  return "bg-gray-50 text-gray-600 border-gray-200";
+};
+
+/* ---------- Small components ---------- */
+const TITLE_KEYS = ["title", "role", "position", "job_title", "name"];
+const COMPANY_KEYS = ["company", "organization", "organisation", "employer"];
+const LINK_KEYS = ["link", "url", "apply_link", "apply_url", "application_url"];
+
+function InternshipCard({ item, index }: { item: Obj; index: number }) {
+  if (typeof item !== "object" || item === null)
+    return <div className="rounded-lg border border-gray-200 p-3 text-sm">{String(item)}</div>;
+  const title = pick(item, TITLE_KEYS) || `Internship ${index + 1}`;
+  const company = pick(item, COMPANY_KEYS);
+  const link = pick(item, LINK_KEYS);
+  const used = [...TITLE_KEYS, ...COMPANY_KEYS, ...LINK_KEYS];
+  const rest = Object.entries(item)
+    .filter(([k, v]) => !used.includes(k) && v !== null && typeof v !== "object" && String(v).trim() !== "")
+    .slice(0, 5);
+  return (
+    <div className="rounded-lg border border-gray-200 bg-white p-4">
+      <div className="flex items-start gap-2">
+        <Briefcase className="w-4 h-4 mt-1 text-indigo-600 shrink-0" />
+        <div className="min-w-0">
+          <div className="font-semibold text-gray-900 text-sm">{title}</div>
+          {company && <div className="text-xs text-gray-600">{company}</div>}
+        </div>
+      </div>
+      {rest.length > 0 && (
+        <dl className="mt-2 space-y-0.5">
+          {rest.map(([k, v]) => (
+            <div key={k} className="text-xs text-gray-600">
+              <span className="font-medium capitalize">{k.replace(/_/g, " ")}:</span> {String(v)}
+            </div>
+          ))}
+        </dl>
+      )}
+      {link && (
+        <a href={link} target="_blank" rel="noreferrer" className="mt-2 inline-block text-xs text-indigo-600 hover:underline break-all">
+          {link}
+        </a>
+      )}
+    </div>
+  );
+}
+
+function EmailCard({ item, index }: { item: Obj; index: number }) {
+  const isObj = typeof item === "object" && item !== null;
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [edited, setEdited] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [subject, setSubject] = useState(isObj ? pick(item, ["subject", "title"]) : "");
+  const [body, setBody] = useState(
+    isObj ? pick(item, ["body", "content", "text", "email", "draft", "message"]) : String(item)
+  );
+  const to = isObj ? pick(item, ["to", "recipient", "email_to"]) : "";
+  const text = subject || body ? `Subject: ${subject}\n\n${body}` : JSON.stringify(item, null, 2);
+
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+  };
+
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50">
+      <button onClick={() => setOpen((o) => !o)} className="w-full flex items-center gap-2 p-3 text-left">
+        {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+        <Mail className="w-4 h-4 text-gray-500" />
+        <span className="text-sm font-medium text-gray-900 flex-1 truncate">
+          {subject || `Draft ${index + 1}`}
+        </span>
+        {edited && (
+          <span className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-full px-2 py-0.5">
+            edited
+          </span>
+        )}
+        {to && <span className="text-xs text-gray-500 hidden sm:inline">To: {to}</span>}
+      </button>
+
+      {open && (
+        <div className="px-4 pb-4">
+          {editing ? (
+            <>
+              <input
+                value={subject}
+                onChange={(e) => { setSubject(e.target.value); setEdited(true); }}
+                className="w-full mb-2 rounded-lg border border-gray-200 px-3 py-1.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              />
+              <textarea
+                value={body}
+                onChange={(e) => { setBody(e.target.value); setEdited(true); }}
+                rows={8}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              />
+            </>
+          ) : subject || body ? (
+            <p className="text-sm text-gray-800 whitespace-pre-wrap">{body}</p>
+          ) : (
+            <pre className="text-xs overflow-auto">{text}</pre>
+          )}
+
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={() => setEditing((v) => !v)}
+              className="inline-flex items-center gap-1.5 text-xs border border-indigo-200 text-indigo-700 bg-white rounded-md px-2.5 py-1 hover:bg-indigo-50"
+            >
+              {editing ? "Save" : "Edit"}
+            </button>
+            <button
+              onClick={copy}
+              className="inline-flex items-center gap-1.5 text-xs border border-gray-200 bg-white rounded-md px-2.5 py-1 hover:bg-gray-100"
+            >
+              {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AuditLog({ log }: { log: AuditEntry[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="bg-white border border-gray-100 rounded-xl shadow-sm p-5 mb-4">
+      <button onClick={() => setOpen((o) => !o)} className="w-full flex items-center gap-2 text-left">
+        {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+        <ShieldCheck className="w-4 h-4 text-indigo-600" />
+        <h2 className="font-semibold text-gray-900">Audit log</h2>
+        <span className="text-xs text-gray-500">({log.length} events)</span>
+      </button>
+      {open && (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-gray-500">
+                <th className="py-1 pr-3">Time</th><th className="py-1 pr-3">Node</th>
+                <th className="py-1 pr-3">Event</th><th className="py-1">Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {log.map((l, i) => (
+                <tr key={i} className="border-t border-gray-100 align-top">
+                  <td className="py-1.5 pr-3 font-mono text-gray-500 whitespace-nowrap">{l.time}</td>
+                  <td className="py-1.5 pr-3 text-gray-700">{l.node}</td>
+                  <td className="py-1.5 pr-3">
+                    <span className={`inline-block border rounded-full px-2 py-0.5 ${eventStyle(l.event)}`}>{l.event}</span>
+                  </td>
+                  <td className="py-1.5 text-gray-600">{l.detail}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Page ---------- */
+export default function OperatorPage() {
+  const [goal, setGoal] = useState(DEFAULT_GOAL);
+  const [simulate, setSimulate] = useState(false);
+  const [data, setData] = useState<Resp | null>(null);
+  const [busy, setBusy] = useState<null | "start" | "approve" | "reject" | "retry">(null);
+  const [error, setError] = useState<string | null>(null);
+  const [visible, setVisible] = useState(0);
+  const prevThread = useRef<string | null>(null);
+
+  // reveal progress messages one by one on a fresh run (live-looking)
+  useEffect(() => {
+    const total = data?.messages?.length ?? 0;
+    if (!data) { prevThread.current = null; setVisible(0); return; }
+    if (prevThread.current === data.thread_id) { setVisible(total); return; }
+    prevThread.current = data.thread_id;
+    setVisible(0);
+    if (!total) return;
+    let i = 0;
+    const id = setInterval(() => { i++; setVisible(i); if (i >= total) clearInterval(id); }, 350);
+    return () => clearInterval(id);
+  }, [data]);
+
+  const start = async () => {
+    if (!goal.trim()) return;
+    setError(null); setBusy("start");
+    try {
+      setData(await post("/internship/start", { goal: goal.trim(), simulate_failures: simulate ? 2 : null }));
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(null); }
+  };
+
+  const decide = async (action: "approve" | "reject" | "retry") => {
+    if (!data) return;
+    setError(null); setBusy(action);
+    try {
+      setData(await post("/internship/decide", { thread_id: data.thread_id, action }));
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(null); }
+  };
+
+  const reset = () => { setData(null); setError(null); setGoal(DEFAULT_GOAL); setSimulate(false); setBusy(null); };
+
+  const paused = !!data?.requires_input;
+  const finished = !!data && !data.requires_input;
+  const internships = data?.internships?.length ? data.internships : data?.interrupt?.internships ?? [];
+  const emails = data?.drafted_emails?.length ? data.drafted_emails : data?.interrupt?.drafted_emails ?? [];
+  const showRetry = !!data && (!data.spreadsheet_saved || !!data.error_status);
+  const messages = data?.messages ?? [];
+  const lastMsg = messages[messages.length - 1] ?? "";
+  const inFlight = busy !== null;
+
+  const resultTone =
+    data?.approval_status === "approved" && data.spreadsheet_saved
+      ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+      : data?.approval_status === "approved"
+      ? "border-amber-300 bg-amber-50 text-amber-900"
+      : "border-gray-300 bg-gray-50 text-gray-800";
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-gray-50 to-indigo-50/40 py-10 px-4">
       <div className="max-w-3xl mx-auto">
-        {/* Header */}
-        <div className="flex items-center gap-3 mb-1">
-          <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center">
-            <Bot className="w-6 h-6" />
-          </div>
-          <h1 className="text-2xl font-bold text-gray-900">
-            Autonomous AI Operator — Internship &amp; Task Automation
-          </h1>
-        </div>
-        <p className="text-gray-600 text-sm mb-6 ml-[52px]">
-          Give it a goal. It plans, researches, saves to a spreadsheet, drafts emails — and
-          pauses for your approval before anything is sent.
+        <h1 className="text-2xl font-bold text-gray-900">
+          Autonomous AI Operator — Internship &amp; Task Automation
+        </h1>
+        <p className="text-gray-600 text-sm mt-1 mb-6">
+          It finds internships, drafts emails, saves a spreadsheet, and pauses for your approval.
         </p>
-
-        {/* Goal input */}
-        <div className="bg-white border border-gray-100 rounded-xl shadow-sm p-4 mb-4">
-          <label className="block text-sm font-medium text-gray-700 mb-2">Your goal</label>
-          <textarea
-            value={task}
-            onChange={(e) => setTask(e.target.value)}
-            disabled={busy || reviewing}
-            rows={3}
-            placeholder="e.g. Find three internships for a third-year CS student and draft application emails…"
-            className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:bg-gray-50"
-          />
-          <div className="flex flex-wrap items-center gap-2 mt-3">
-            <button
-              onClick={() => (phase === "sent" ? reset() : startRun())}
-              disabled={busy || reviewing || (phase !== "sent" && !task.trim())}
-              className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg px-4 py-2 text-sm font-medium"
-            >
-              {phase === "running" ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-              {phase === "sent" ? "New task" : "Run operator"}
-            </button>
-            <button
-              onClick={() => startRun(PRESET_PROMPT)}
-              disabled={busy || reviewing}
-              className="inline-flex items-center gap-1.5 bg-white border border-indigo-200 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 rounded-lg px-4 py-2 text-sm font-medium"
-              title={PRESET_PROMPT}
-            >
-              <Sparkles className="w-4 h-4" /> Try demo: Internship search
-            </button>
-            <button
-              onClick={() => setTask(PRESET_PROMPT)}
-              disabled={busy || reviewing}
-              className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-800 disabled:opacity-50"
-            >
-              <Play className="w-3 h-3" /> Fill prompt only
-            </button>
-          </div>
-        </div>
 
         {error && (
           <div className="mb-4 flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">
-            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
-            {error}
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" /> <span>{error}</span>
           </div>
         )}
 
-        {/* Execution timeline + log */}
-        {phase !== "idle" && (
-          <div className="bg-white border border-gray-100 rounded-xl shadow-sm p-5 mb-4">
-            <h2 className="font-semibold text-gray-900 mb-3">Execution status</h2>
-            <ol className="space-y-2">
-              {steps.map((s) => (
-                <li key={s.id} className="flex items-center gap-2.5 text-sm">
-                  {s.status === "done" && <CheckCircle2 className="w-5 h-5 text-emerald-600" />}
-                  {s.status === "running" && (
-                    <Loader2 className="w-5 h-5 text-indigo-600 animate-spin" />
-                  )}
-                  {s.status === "pending" && <Circle className="w-5 h-5 text-gray-300" />}
-                  {s.status === "error" && <AlertTriangle className="w-5 h-5 text-red-600" />}
-                  <span
-                    className={
-                      s.status === "pending"
-                        ? "text-gray-400"
-                        : s.status === "error"
-                        ? "text-red-700"
-                        : "text-gray-800"
-                    }
-                  >
-                    {s.label}
-                  </span>
-                </li>
+        {/* 1. Start form */}
+        {!data && busy !== "start" && (
+          <div className="bg-white border border-gray-100 rounded-xl shadow-sm p-5">
+            <label className="block text-sm font-medium text-gray-700 mb-2">Your goal</label>
+            <input
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+            />
+            <label className="mt-3 flex items-center gap-2 text-sm text-gray-700">
+              <input type="checkbox" checked={simulate} onChange={(e) => setSimulate(e.target.checked)} />
+              Simulate Excel outage (demo)
+            </label>
+            <button
+              onClick={start}
+              disabled={!goal.trim()}
+              className="mt-4 inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg px-4 py-2 text-sm font-medium"
+            >
+              <Send className="w-4 h-4" /> Start
+            </button>
+          </div>
+        )}
+
+        {/* Loading skeleton */}
+        {busy === "start" && (
+          <div className="bg-white border border-gray-100 rounded-xl shadow-sm p-5">
+            <div className="flex items-center gap-2 text-indigo-700 font-medium text-sm mb-4">
+              <Loader2 className="w-4 h-4 animate-spin" /> Running the workflow… this can take several seconds
+            </div>
+            <div className="space-y-2 animate-pulse">
+              {[80, 65, 72, 50].map((w, i) => (
+                <div key={i} className="h-3 rounded bg-gray-200" style={{ width: `${w}%` }} />
               ))}
-            </ol>
-            <div className="mt-4 max-h-32 overflow-y-auto rounded-lg bg-gray-900 text-gray-200 text-xs font-mono p-3 space-y-1">
-              {log.map((l, i) => (
-                <div key={i}>
-                  <span className="text-gray-500">[{l.t}]</span> {l.msg}
-                </div>
-              ))}
-              <div ref={logEnd} />
             </div>
           </div>
         )}
 
-        {/* Human-in-the-loop approval card */}
-        {reviewing && (
-          <div className="bg-white border border-amber-200 rounded-xl shadow-sm p-5 mb-4">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="font-semibold text-gray-900">Review required</h2>
-              <span className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2.5 py-0.5">
-                Paused for human approval
-              </span>
-            </div>
+        {data && (
+          <>
+            {/* 2. Progress / plan */}
+            <div className="bg-white border border-gray-100 rounded-xl shadow-sm p-5 mb-4">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="font-semibold text-gray-900">Plan &amp; progress</h2>
+                <span className="text-xs text-gray-500">Automatic retries used: {data.retry_count}</span>
+              </div>
 
-            {/* Spreadsheet success indicator */}
-            {spreadsheet && (
-              <div className="flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 mb-4">
-                <FileSpreadsheet className="w-8 h-8 text-emerald-600 shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1.5 text-sm font-semibold text-emerald-800">
-                    <CheckCircle2 className="w-4 h-4" />
-                    Spreadsheet generated{spreadsheet.verified ? " & verified" : ""}
+              {data.retry_count > 0 && (
+                data.spreadsheet_saved ? (
+                  <div className="mb-3 text-sm rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 p-3">
+                    Spreadsheet save failed {data.retry_count} time{data.retry_count > 1 ? "s" : ""}, recovered
+                    automatically on attempt {data.retry_count + 1}.
                   </div>
-                  <div className="text-xs text-emerald-700 truncate">
-                    {spreadsheet.filename}
-                    {spreadsheet.rows != null && ` · ${spreadsheet.rows} internships saved`}
+                ) : (
+                  <div className="mb-3 text-sm rounded-lg border border-amber-200 bg-amber-50 text-amber-800 p-3">
+                    Spreadsheet save failed after {data.retry_count} automatic retr{data.retry_count > 1 ? "ies" : "y"}.
                   </div>
-                </div>
-                {spreadsheet.url && (
-                  <a
-                    href={spreadsheet.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 hover:text-emerald-900"
-                  >
-                    <Download className="w-4 h-4" /> Open
-                  </a>
+                )
+              )}
+
+              {!!data.plan?.length && (
+                <ol className="space-y-1.5 mb-3">
+                  {data.plan.map((p, i) => (
+                    <li key={i} className="flex items-start gap-2 text-sm text-gray-800">
+                      <CheckCircle2 className="w-4 h-4 mt-0.5 text-emerald-600 shrink-0" /> {p}
+                    </li>
+                  ))}
+                </ol>
+              )}
+
+              <ul className="space-y-1">
+                {messages.slice(0, visible).map((m, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs text-gray-600">
+                    <Circle className="w-2.5 h-2.5 mt-1 text-gray-400 shrink-0" /> {m}
+                  </li>
+                ))}
+                {visible < messages.length && (
+                  <li className="flex items-center gap-2 text-xs text-indigo-600">
+                    <Loader2 className="w-3 h-3 animate-spin" /> working…
+                  </li>
                 )}
-              </div>
-            )}
+              </ul>
+            </div>
 
-            {/* Email previews */}
-            <div className="space-y-3">
-              {emails.map((em, i) => (
-                <div key={em.id} className="rounded-lg border border-gray-200 bg-gray-50 p-4">
-                  <div className="flex items-center gap-1.5 text-xs font-medium text-gray-500 mb-2">
-                    <Mail className="w-4 h-4" /> Draft {i + 1} of {emails.length}
-                    {em.to && <span className="text-gray-400">· To: {em.to}</span>}
+            {/* 3. Approval panel */}
+            {paused && (
+              <div className="bg-white border border-amber-200 rounded-xl shadow-sm p-5 mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="font-semibold text-gray-900">Review required</h2>
+                  <span className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2.5 py-0.5">
+                    Paused for human approval
+                  </span>
+                </div>
+                {data.interrupt?.message && <p className="text-sm text-gray-700 mb-3">{data.interrupt.message}</p>}
+
+                {/* Spreadsheet status */}
+                {data.spreadsheet_saved ? (
+                  <div className="flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 mb-4">
+                    <FileSpreadsheet className="w-7 h-7 text-emerald-600 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-emerald-800">Spreadsheet saved</div>
+                      <div className="text-xs text-emerald-700 break-all">{data.spreadsheet_path}</div>
+                    </div>
                   </div>
-                  {editing ? (
-                    <>
-                      <input
-                        value={em.subject}
-                        onChange={(e) => updateEmail(em.id, { subject: e.target.value })}
-                        className="w-full mb-2 rounded-lg border border-gray-200 px-3 py-1.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                      />
-                      <textarea
-                        value={em.body}
-                        onChange={(e) => updateEmail(em.id, { body: e.target.value })}
-                        rows={7}
-                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                      />
-                    </>
-                  ) : (
-                    <>
-                      <div className="text-sm font-semibold text-gray-900 mb-1">
-                        {em.subject}
-                      </div>
-                      <p className="text-sm text-gray-800 whitespace-pre-wrap">{em.body}</p>
-                    </>
-                  )}
-                </div>
-              ))}
-            </div>
+                ) : (
+                  <div className="flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 p-3 mb-4">
+                    <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="text-sm font-semibold text-red-800">Spreadsheet not saved</div>
+                      <div className="text-xs text-red-700">{data.error_status || "Unknown error"}</div>
+                    </div>
+                  </div>
+                )}
 
-            {/* Reject feedback */}
-            {rejecting && (
-              <div className="mt-4">
-                <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                  What should change? The operator will redraft:
-                </label>
-                <textarea
-                  value={feedback}
-                  onChange={(e) => setFeedback(e.target.value)}
-                  rows={3}
-                  placeholder="e.g. Make the emails shorter and mention my portfolio project"
-                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-rose-300"
-                />
-                <div className="flex gap-2 mt-2">
+                <h3 className="text-sm font-semibold text-gray-800 mb-2">Internships ({internships.length})</h3>
+                <div className="grid gap-3 sm:grid-cols-2 mb-4">
+                  {internships.map((it, i) => <InternshipCard key={i} item={it} index={i} />)}
+                </div>
+
+                <h3 className="text-sm font-semibold text-gray-800 mb-2">Email drafts ({emails.length})</h3>
+                <div className="space-y-2 mb-4">
+                  {emails.map((em, i) => <EmailCard key={i} item={em} index={i} />)}
+                </div>
+                <p className="text-xs text-gray-500 mb-4">Emails are drafts only. Nothing is sent.</p>
+
+                <div className="flex flex-wrap gap-2">
                   <button
-                    onClick={() => decide("reject")}
-                    disabled={busy || !feedback.trim()}
-                    className="inline-flex items-center gap-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg px-3 py-1.5 text-sm font-medium"
+                    onClick={() => decide("approve")} disabled={inFlight}
+                    className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg px-4 py-2 text-sm font-medium"
                   >
-                    <X className="w-4 h-4" /> Request changes
+                    {busy === "approve" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Approve
                   </button>
                   <button
-                    onClick={() => setRejecting(false)}
-                    className="text-sm text-gray-500 hover:text-gray-800 px-2"
+                    onClick={() => decide("reject")} disabled={inFlight}
+                    className="inline-flex items-center gap-1.5 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 text-gray-800 rounded-lg px-4 py-2 text-sm font-medium"
                   >
-                    Cancel
+                    {busy === "reject" ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />} Reject
                   </button>
+                  {showRetry && (
+                    <button
+                      onClick={() => decide("retry")} disabled={inFlight}
+                      className="inline-flex items-center gap-1.5 bg-white border border-amber-300 text-amber-800 hover:bg-amber-50 disabled:opacity-50 rounded-lg px-4 py-2 text-sm font-medium"
+                    >
+                      {busy === "retry" ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Retry save
+                    </button>
+                  )}
                 </div>
               </div>
             )}
 
-            {/* Action bar */}
-            {!rejecting && (
-              <div className="flex flex-wrap gap-2 mt-4">
+            {/* 4. Final result */}
+            {finished && (
+              <div className={`border rounded-xl shadow-sm p-5 mb-4 ${resultTone}`}>
+                <div className="flex items-center gap-2 font-semibold mb-2">
+                  <CheckCircle2 className="w-5 h-5" />
+                  {data.approval_status === "rejected" ? "Run rejected" : "Workflow complete"}
+                </div>
+                <p className="text-sm whitespace-pre-wrap">{lastMsg}</p>
+                <p className="text-xs mt-3 opacity-80">Emails are drafts only. Nothing was sent.</p>
                 <button
-                  onClick={() => decide(dirty ? "edit" : "approve")}
-                  disabled={busy}
-                  className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg px-4 py-2 text-sm font-medium"
+                  onClick={reset}
+                  className="mt-4 inline-flex items-center gap-1.5 bg-white border border-gray-300 hover:bg-gray-50 text-gray-800 rounded-lg px-4 py-2 text-sm font-medium"
                 >
-                  {phase === "deciding" ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Check className="w-4 h-4" />
-                  )}
-                  {dirty ? "Approve edits & Send" : "Approve & Send"}
-                </button>
-                <button
-                  onClick={() => setEditing((v) => !v)}
-                  disabled={busy}
-                  className="inline-flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-800 rounded-lg px-4 py-2 text-sm font-medium"
-                >
-                  <Pencil className="w-4 h-4" /> {editing ? "Done editing" : "Edit"}
-                </button>
-                <button
-                  onClick={() => setRejecting(true)}
-                  disabled={busy}
-                  className="inline-flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-800 rounded-lg px-4 py-2 text-sm font-medium"
-                >
-                  <X className="w-4 h-4" /> Reject
+                  Start new run
                 </button>
               </div>
             )}
-          </div>
-        )}
 
-        {/* Completion */}
-        {phase === "sent" && (
-          <div className="bg-white border border-emerald-200 rounded-xl shadow-sm p-5">
-            <div className="flex items-center gap-2 text-emerald-700 font-semibold mb-2">
-              <CheckCircle2 className="w-5 h-5" /> Workflow complete
-            </div>
-            {spreadsheet && (
-              <p className="text-sm text-gray-700 mb-2">
-                Spreadsheet <span className="font-mono">{spreadsheet.filename}</span> saved.
-              </p>
-            )}
-            {finalOutput && (
-              <div className="prose prose-sm max-w-none text-gray-800">
-                <ReactMarkdown>{finalOutput}</ReactMarkdown>
-              </div>
-            )}
-          </div>
+            {/* 5. Audit log */}
+            {!!data.audit_log?.length && <AuditLog log={data.audit_log} />}
+          </>
         )}
       </div>
     </main>
